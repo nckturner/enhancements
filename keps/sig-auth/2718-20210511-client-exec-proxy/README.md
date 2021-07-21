@@ -58,7 +58,7 @@ If none of those approvers are still appropriate, then changes to that list
 should be approved by the remaining approvers and/or the owning SIG (or
 SIG Architecture for cross-cutting KEPs).
 -->
-# KEP-NNNN: Client Executable Proxy
+# KEP-2718: Client Executable Proxy
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -73,6 +73,8 @@ SIG Architecture for cross-cutting KEPs).
   - [Notes/Constraints/Caveats (Optional)](#notesconstraintscaveats-optional)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
+  - [Proxy Proposal](#proxy-proposal)
+    - [Extending ExecConfig](#extending-execconfig)
   - [Test Plan](#test-plan)
   - [Graduation Criteria](#graduation-criteria)
   - [Upgrade / Downgrade Strategy](#upgrade--downgrade-strategy)
@@ -87,6 +89,7 @@ SIG Architecture for cross-cutting KEPs).
 - [Implementation History](#implementation-history)
 - [Drawbacks](#drawbacks)
 - [Alternatives](#alternatives)
+  - [Alternative Proposal: Request Replacement](#alternative-proposal-request-replacement)
 - [Infrastructure Needed (Optional)](#infrastructure-needed-optional)
 <!-- /toc -->
 
@@ -149,7 +152,7 @@ updates.
 [documentation style guide]: https://github.com/kubernetes/community/blob/master/contributors/guide/style-guide.md
 -->
 
-Client authentication in Kubernetes can be achieved via one of a handful of mechanisms: by passing a bearer token directly to kubectl using the `--token` flag, by inserting a bearer token into the kubeconfig, by inserting a client certificate and key into the kubeconfig, or by defining an exec-based token plugin in the kubeconfig which supports calling an arbitrary binary which is expected to return a bearer token.  The client executable proxy adds an extension point for additional authentication mechanisms that are difficult to set up with the current architecture.  Client request signing [[1]](https://github.com/kubernetes/kubernetes/issues/92535), and an external TLS certificate authenticator [[2]](https://github.com/kubernetes/enhancements/pull/1749) are two use cases that would benefit from this proposal.
+Client authentication in Kubernetes can be achieved via one of a handful of mechanisms: by passing a bearer token directly to kubectl using the `--token` flag, by inserting a bearer token into the kubeconfig, by inserting a client certificate and key into the kubeconfig, or by defining an exec-based token plugin in the kubeconfig which supports calling an arbitrary binary which is expected to return a bearer token.  The client exec proxy adds an extension point for additional authentication mechanisms that are difficult to set up with the current architecture.  Client request signing, and an external TLS certificate authenticator are two use cases that would benefit from this proposal.
 
 ## Motivation
 
@@ -162,9 +165,11 @@ demonstrate the interest in a KEP within the wider Kubernetes community.
 [experience reports]: https://github.com/golang/go/wiki/ExperienceReports
 -->
 
-The motivation for this KEP stems from the inability of the existing authentication mechanisms to satisfy the author's requirement to implement a Kubernetes client that implements AWS's request signing process, known as Signature Version 4 (sig-v4).  In order to implement sig-v4, a canonical version of the request must be created, combined with any requered additional metadata, signed by the secret key, and the signature appended to the request in a header or query string parameter.  In order to achieve this, the request signer must have access to the entire request, so the existing exec-based authentication is unsatisfactory.  A generic solution is desirable to satisfy all other future request signing feature requests.
+The motivation for this KEP stems from the inability of the existing authentication mechanisms to satisfy the author's requirement to implement a Kubernetes client that implements AWS's request signing process, known as Signature Version 4 (sig-v4) [[1]](https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html) [[2]](https://github.com/kubernetes/kubernetes/issues/92535). In order to implement sig-v4, a canonical version of the request must be created, combined with any required additional metadata, signed by the secret key, and the signature appended to the request in a header or query string parameter.  In order to achieve this, the request signer must have access to the entire request, so the existing exec-based authentication is unsatisfactory.  A generic solution is desirable to satisfy other future request signing or request modifying feature requests.
 
-The solution that exists today is to use the existing proxy configuration in client-go.  The includes configuring a proxy via the environment variables, HTTP_PROXY or HTTPS_PROXY, or using the explicit proxy URL supported by kubeconfig [[3]](https://github.com/kubernetes/kubernetes/pull/81443).  The problem with the solutions that exists today is that the operator experience of setting up and managing such a solution is poor.  For example, to implement a request signing proxy for kubelet, one has to manage the proxy process with an init system of some kind, and secure the proxy endpoint, both of which require significant, non-trivial configuration outside of Kubernetes.
+The solution that exists today is to use the existing proxy configuration in client-go.  The includes configuring a proxy via the environment variables, HTTP_PROXY or HTTPS_PROXY, or using the explicit proxy URL supported by kubeconfig [[3]](https://github.com/kubernetes/kubernetes/pull/81443).  The problem with this solution is that the operator experience of setting up and managing an external proxy is poor.  For example, to implement a request signing proxy for kubelet, one has to manage the proxy process with an init system of some kind, and secure the proxy endpoint, both of which require significant, non-trivial configuration outside of Kubernetes.
+
+Another use case is using an external TLS certificate signer [[4]](https://github.com/kubernetes/enhancements/pull/1749).  This would allow usage of TLS client certificates within client-go, by delegating digital key operations to extarnal processes, for example, an HSM.
 
 ### Goals
 
@@ -257,35 +262,17 @@ proposal will be implemented, this is the place to discuss them.
 
 ### Proxy Proposal
 
-The request signing proxy is a long-running proxy process which is executed by the client on first use.  This proposal would add configuration options to allow an executed binary to return a localhost port or UDS socket address, over which the client would proxy all API server bound requests.  An additional configuration section for the kubeconfig defines a proxy binary location.
+The proxy exec plugin is a long-running proxy process which is executed by the client on first use.  The proxy binary location is defined in the `ExecConfig` section of a kubeconfig `user`.  When executed, the exec proxy plugin will bind and listen on a socket, and will return either a port or a UDS socket address on stdout, over which the client would proxy all API server bound requests.
 
-Questions to answer:
+The proxy plugin process will be executed from client-go the first time it is needed, on transport setup.  If the client fails to connect to the socket because no one is listening, client-go will reattempt to exec the plugin.  Client-go will support both plugins binaries which are themselves the proxy process, and additionally plugin binaries which complete, but are responsible for somehow starting a proxy process and returning its listening address.
 
-1. What is the lifetime of the proxy plugin?
-
-    The proxy plugin process will be executed from a goroutine (executor) the first time it is needed, i.e. on transport setup.  The executor goroutine will complete when the exec command completes.  The client-go library will have an additional work queue.  If the client fails to connect to the socket because no one is listening, an item will be added to the work queue.  An additional goroutine worker will be waiting for work items, and will spawn a new executor goroutine.
-
-1. How does the client find the proxy plugin binary?
-
-   The ExecConfig struct provides the location of the binary to be executed.
-
-1. When using the proxy plugin, who is responsible for sending the request to the API server?
-
-   The client will send its request to the proxy plugin process, and the proxy will forward the request to the API server, rather than returning the modified request to the client to be sent (see alternatives considered).  The downside of this approach is that the proxy must duplicate the some of the transport functionality of client packages, but allows for more flexibility for proxy plugin developers.
-
-1. Who is responsible for creating the unix domain socket?
-
-   The listening unix domain socket is created by the proxy plugin process.
-
-1. What does the the entire process look like?
-
-   The client attempts a connection to the unix domain socket address (file path) and if it fails, it executes the proxy plugin process, passing the listening address.  The listening unix domain socket is then created by the proxy plugin process and bound to the file path that is passed by the client.  The client then connects to address and upon successful connection, the client sends all requests destined for the kube-apiserver to the proxy plugin.
+The client will send its request to the proxy plugin process, and the proxy will forward the request to the API server, rather than returning the modified request to the client to be sent (see alternatives considered).  The downside of this approach is that the proxy must duplicate the some of the transport functionality of client packages, but allows for more flexibility for proxy plugin developers.
 
 #### Extending ExecConfig
 
 This proposal extends the ExecConfig API object to include configuration options for the proxy process.
 
-The ExecConfig would be extended to include a local address, which will be passed to the exec plugin.  The exec plugin will create a socket and listen on this address, which can either be a Unix domain socket.
+The ExecConfig would be extended to include a local address, which will be passed to the exec plugin.  The exec plugin will create a socket and listen on this address, which can either be a Unix domain socket or a TCP/IP socket.
 
 ```go
 type ExecConfig struct {
@@ -315,8 +302,7 @@ type ExecConfig struct {
 The ExecProxyConfig includes the address where the proxy is expected to listen.
 ```go
 type ExecProxyConfig struct {
-	// The socket path where the proxy should listen.
-	UnixSocketPath string `json:"unixSocketPath"`
+    // Do we need any proxy configuration defined in the kubeconfig?
 }
 ```
 
@@ -334,12 +320,32 @@ type ExecProxyRequest struct {
 	Interactive bool `json:"interactive"`
 
 	// +optional
-	// The destination Kubernetes cluster.
+	// Cluster is the destination Kubernetes cluster.  This includes Server address, TLSServerName, CertificateAuthorityData and ProxyURL.
 	Cluster *Cluster `json:"cluster"`
 }
 
 type ExecProxyResponse struct {
 	metav1.TypeMeta
+
+	Listener Address `json: "address"`
+
+	// +optional
+	CertificateAuthorityData []byte `json:"certificate-authority-data,omitempty"`
+
+	// +optional
+	ClientCertificate []byte `json:"client-certificate"`
+}
+
+type Address struct {
+	// +optional
+	UnixSocket UnixSocket
+
+	// +optional
+	Port int `json:"port"`
+}
+
+type UnixSocket struct {
+	Path string `json:"path"`
 }
 ```
 
@@ -353,8 +359,6 @@ Example kubeconfig:
       args:
       - --region=us-west-2
       command: /usr/local/bin/sigv4proxy
-      execProxy:
-        unixSocketPath: /var/run/kubelet/signer.sock
 ```
 
 ### Test Plan
